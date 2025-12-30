@@ -1,34 +1,58 @@
 #!/usr/bin/env python3
 """
 Jeeves STT Server
-Wake word detection + real-time speech-to-text
+Multi-mode speech-to-text: Command mode (Whisper) + Transcription mode
 """
 
 import asyncio
 import websockets
 import numpy as np
-import collections
 import time
+import re
 from typing import Optional
+from dataclasses import dataclass
+from enum import Enum
 import whisper
 import torch
 from openwakeword.model import Model as WakeWordModel
 
-# Audio config (must match client)
+# Audio config
 SAMPLE_RATE = 16000
 CHANNELS = 1
-BYTES_PER_SAMPLE = 2  # int16
+BYTES_PER_SAMPLE = 2
 
 # Wake word settings
 WAKE_THRESHOLD = 0.5
-POST_WAKE_DELAY = 0.3  # Seconds to discard after wake word (removes "alexa" from transcript)
+POST_WAKE_DELAY = 0.3
 
-# VAD / Recording settings
-SILENCE_THRESHOLD = 0.01  # RMS threshold for silence
-MIN_SPEECH_DURATION = 0.3  # Minimum speech before considering silence
-INITIAL_SILENCE_DURATION = 1.5  # Longer patience at start
-SHORT_SILENCE_DURATION = 0.7  # Shorter silence after speech detected
-MAX_RECORDING = 15.0  # Max seconds to record
+# Command mode settings
+SILENCE_THRESHOLD = 0.01
+MIN_SPEECH_DURATION = 0.3
+INITIAL_SILENCE_DURATION = 1.5
+SHORT_SILENCE_DURATION = 0.7
+MAX_COMMAND_DURATION = 15.0
+
+# Transcription mode settings
+TRANSCRIPTION_CHUNK_DURATION = 5.0
+MAX_TRANSCRIPTION_DURATION = 300.0
+STOP_PHRASES = [
+    "stop transcription",
+    "end transcription",
+    "stop dictation",
+    "end dictation",
+    "that's all",
+    "that is all",
+    "finish transcription",
+    "done transcribing",
+]
+
+TRANSCRIPTION_TRIGGERS = [
+    "enter transcription mode",
+    "start transcription",
+    "transcription mode",
+    "start dictating",
+    "dictation mode",
+]
 
 DEBUG = False
 
@@ -43,6 +67,12 @@ def debug(msg: str):
         log(msg, "DEBUG")
 
 
+class Mode(Enum):
+    LISTENING = "listening"
+    COMMAND = "command"
+    TRANSCRIPTION = "transcription"
+
+
 class JeevesServer:
     def __init__(self, host: str = '0.0.0.0', port: int = 8765):
         self.host = host
@@ -55,17 +85,22 @@ class JeevesServer:
         
         log("Loading models...")
         
+        # Whisper for command mode
         device = "cuda" if torch.cuda.is_available() else "cpu"
         log(f"  Loading Whisper model (small) on {device}...")
         load_start = time.time()
         self.whisper_model = whisper.load_model("small", device=device)
         log(f"  Whisper loaded in {time.time() - load_start:.1f}s")
         
+        # TODO: Add Parakeet for transcription mode
+        log("  Parakeet not yet implemented - using Whisper for transcription mode")
+        
+        # openWakeWord - no inference_framework argument in newer versions
         log("  Loading openWakeWord...")
         load_start = time.time()
-        self.wake_model = WakeWordModel(inference_framework="onnx")
+        self.wake_model = WakeWordModel()
         self.wake_word_names = list(self.wake_model.models.keys())
-        log(f"  Wake words available: {self.wake_word_names}")
+        log(f"  Wake words: {self.wake_word_names}")
         log(f"  openWakeWord loaded in {time.time() - load_start:.1f}s")
         
         log("All models loaded!")
@@ -78,7 +113,6 @@ class JeevesServer:
         return self.get_audio_level(audio_bytes) < SILENCE_THRESHOLD
 
     def detect_wake_word(self, audio_bytes: bytes) -> tuple[bool, float, str]:
-        """Returns (detected, score, wake_word_name)"""
         audio = np.frombuffer(audio_bytes, dtype=np.int16)
         prediction = self.wake_model.predict(audio)
         
@@ -94,12 +128,12 @@ class JeevesServer:
         
         return detected_word is not None, max_score, detected_word
 
-    def transcribe(self, audio_data: bytes) -> str:
+    def transcribe_audio(self, audio_data: bytes) -> str:
+        """Transcribe audio using Whisper"""
         audio = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
         
-        duration = len(audio) / SAMPLE_RATE
-        log(f"Transcribing {duration:.1f}s of audio...")
-        start_time = time.time()
+        if len(audio) < SAMPLE_RATE * 0.1:
+            return ""
         
         audio = whisper.pad_or_trim(audio)
         mel = whisper.log_mel_spectrogram(audio).to(self.whisper_model.device)
@@ -107,11 +141,22 @@ class JeevesServer:
         options = whisper.DecodingOptions(language="en", fp16=torch.cuda.is_available())
         result = whisper.decode(self.whisper_model, mel, options)
         
-        text = result.text.strip()
-        elapsed = time.time() - start_time
-        
-        log(f"Transcription complete in {elapsed:.2f}s")
-        return text
+        return result.text.strip()
+
+    def check_transcription_trigger(self, text: str) -> bool:
+        text_lower = text.lower()
+        for trigger in TRANSCRIPTION_TRIGGERS:
+            if trigger in text_lower:
+                return True
+        return False
+
+    def check_stop_phrase(self, text: str) -> tuple[bool, str]:
+        text_lower = text.lower()
+        for phrase in STOP_PHRASES:
+            if phrase in text_lower:
+                cleaned = re.sub(re.escape(phrase), '', text_lower, flags=re.IGNORECASE).strip()
+                return True, cleaned
+        return False, text
 
     async def handle_client(self, websocket, path=None):
         client_addr = websocket.remote_address
@@ -119,10 +164,14 @@ class JeevesServer:
         
         self.wake_model.reset()
         
-        state = "LISTENING"
-        recording_buffer = bytearray()
+        mode = Mode.LISTENING
+        audio_buffer = bytearray()
+        transcription_buffer = bytearray()
+        full_transcription = []
+        
         silence_start: Optional[float] = None
         recording_start: Optional[float] = None
+        last_chunk_time: Optional[float] = None
         speech_detected = False
         post_wake_discard_until: Optional[float] = None
         
@@ -135,94 +184,171 @@ class JeevesServer:
                         continue
                     elif message.startswith("TRIGGER:"):
                         log("Manual trigger received")
-                        await websocket.send("STATUS:Recording...")
-                        recording_buffer = bytearray()
+                        await websocket.send("STATUS:Recording command...")
+                        audio_buffer = bytearray()
                         recording_start = time.time()
                         silence_start = None
                         speech_detected = False
                         post_wake_discard_until = None
-                        state = "RECORDING"
+                        mode = Mode.COMMAND
                         continue
                 
                 audio_chunk = message
-                audio_level = self.get_audio_level(audio_chunk)
+                now = time.time()
                 
-                if state == "LISTENING":
+                # === LISTENING MODE ===
+                if mode == Mode.LISTENING:
                     detected, score, wake_word = self.detect_wake_word(audio_chunk)
                     
                     if detected:
                         log(f"Wake word '{wake_word}' detected (score: {score:.2f})")
                         await websocket.send(f"WAKE:{wake_word}")
                         
-                        # Start recording but discard audio for a short period
-                        # to avoid capturing the wake word itself
-                        recording_buffer = bytearray()
-                        recording_start = time.time()
-                        post_wake_discard_until = time.time() + POST_WAKE_DELAY
+                        audio_buffer = bytearray()
+                        recording_start = now
+                        post_wake_discard_until = now + POST_WAKE_DELAY
                         silence_start = None
                         speech_detected = False
-                        state = "RECORDING"
+                        mode = Mode.COMMAND
                 
-                elif state == "RECORDING":
-                    now = time.time()
+                # === COMMAND MODE ===
+                elif mode == Mode.COMMAND:
                     elapsed = now - recording_start
                     
-                    # Discard audio immediately after wake word
                     if post_wake_discard_until and now < post_wake_discard_until:
-                        debug(f"Discarding post-wake audio ({post_wake_discard_until - now:.2f}s remaining)")
                         continue
-                    
                     post_wake_discard_until = None
-                    recording_buffer.extend(audio_chunk)
                     
-                    # Track if we've heard any speech
+                    audio_buffer.extend(audio_chunk)
+                    
                     if not self.is_silence(audio_chunk):
                         if not speech_detected:
                             debug("Speech detected")
                         speech_detected = True
                         silence_start = None
                     else:
-                        # Silence detected
                         if silence_start is None:
                             silence_start = now
                         
-                        # Variable silence duration based on whether we've heard speech
-                        if speech_detected:
-                            # Already heard speech - use shorter silence threshold
-                            silence_duration = SHORT_SILENCE_DURATION
-                        else:
-                            # Haven't heard speech yet - be more patient
-                            silence_duration = INITIAL_SILENCE_DURATION
+                        silence_duration = INITIAL_SILENCE_DURATION if not speech_detected else SHORT_SILENCE_DURATION
                         
                         if now - silence_start >= silence_duration:
-                            state = "TRANSCRIBING"
-                    
-                    # Max recording limit
-                    if elapsed >= MAX_RECORDING:
-                        log("Max recording duration reached")
-                        state = "TRANSCRIBING"
-                    
-                    if state == "TRANSCRIBING":
-                        # Check if we have enough audio
-                        buffer_duration = len(recording_buffer) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
-                        
-                        if buffer_duration < MIN_SPEECH_DURATION:
-                            log(f"Recording too short ({buffer_duration:.2f}s), discarding")
-                            await websocket.send("STATUS:No command detected")
-                        else:
-                            await websocket.send("STATUS:Transcribing...")
-                            text = self.transcribe(bytes(recording_buffer))
+                            await websocket.send("STATUS:Processing command...")
                             
-                            if text.strip():
-                                log(f"Transcript: '{text}'")
-                                await websocket.send(f"TRANSCRIPT:{text}")
+                            buffer_duration = len(audio_buffer) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                            
+                            if buffer_duration < MIN_SPEECH_DURATION:
+                                await websocket.send("STATUS:No command detected")
                             else:
-                                await websocket.send("STATUS:No speech detected")
+                                log(f"Transcribing command ({buffer_duration:.1f}s)...")
+                                start = time.time()
+                                text = self.transcribe_audio(bytes(audio_buffer))
+                                log(f"Command transcribed in {time.time() - start:.2f}s: '{text}'")
+                                
+                                if text:
+                                    if self.check_transcription_trigger(text):
+                                        log("Entering transcription mode")
+                                        await websocket.send("MODE:transcription")
+                                        await websocket.send("STATUS:Transcription mode - say 'stop transcription' when done")
+                                        
+                                        transcription_buffer = bytearray()
+                                        full_transcription = []
+                                        recording_start = now
+                                        last_chunk_time = now
+                                        silence_start = None
+                                        speech_detected = False
+                                        mode = Mode.TRANSCRIPTION
+                                        continue
+                                    
+                                    await websocket.send(f"COMMAND:{text}")
+                                else:
+                                    await websocket.send("STATUS:No speech detected")
+                            
+                            audio_buffer.clear()
+                            self.wake_model.reset()
+                            mode = Mode.LISTENING
+                            await websocket.send("STATUS:Listening...")
+                            continue
+                    
+                    if elapsed >= MAX_COMMAND_DURATION:
+                        log("Max command duration reached")
+                        await websocket.send("STATUS:Processing command...")
+                        text = self.transcribe_audio(bytes(audio_buffer))
                         
-                        # Reset
-                        recording_buffer.clear()
+                        if text:
+                            if self.check_transcription_trigger(text):
+                                log("Entering transcription mode")
+                                await websocket.send("MODE:transcription")
+                                await websocket.send("STATUS:Transcription mode - say 'stop transcription' when done")
+                                
+                                transcription_buffer = bytearray()
+                                full_transcription = []
+                                recording_start = now
+                                last_chunk_time = now
+                                mode = Mode.TRANSCRIPTION
+                                continue
+                            
+                            await websocket.send(f"COMMAND:{text}")
+                        
+                        audio_buffer.clear()
                         self.wake_model.reset()
-                        state = "LISTENING"
+                        mode = Mode.LISTENING
+                        await websocket.send("STATUS:Listening...")
+                
+                # === TRANSCRIPTION MODE ===
+                elif mode == Mode.TRANSCRIPTION:
+                    elapsed = now - recording_start
+                    transcription_buffer.extend(audio_chunk)
+                    
+                    buffer_duration = len(transcription_buffer) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                    
+                    if buffer_duration >= TRANSCRIPTION_CHUNK_DURATION:
+                        log(f"Processing transcription chunk ({buffer_duration:.1f}s)...")
+                        start = time.time()
+                        chunk_text = self.transcribe_audio(bytes(transcription_buffer))
+                        log(f"Chunk transcribed in {time.time() - start:.2f}s")
+                        
+                        transcription_buffer.clear()
+                        last_chunk_time = now
+                        
+                        if chunk_text:
+                            stopped, cleaned_text = self.check_stop_phrase(chunk_text)
+                            
+                            if cleaned_text:
+                                full_transcription.append(cleaned_text)
+                                await websocket.send(f"PARTIAL:{cleaned_text}")
+                            
+                            if stopped:
+                                log("Stop phrase detected - exiting transcription mode")
+                                
+                                final_text = " ".join(full_transcription)
+                                await websocket.send(f"TRANSCRIPTION:{final_text}")
+                                await websocket.send("MODE:command")
+                                
+                                full_transcription = []
+                                self.wake_model.reset()
+                                mode = Mode.LISTENING
+                                await websocket.send("STATUS:Listening...")
+                                continue
+                    
+                    if elapsed >= MAX_TRANSCRIPTION_DURATION:
+                        log("Max transcription duration reached")
+                        
+                        if len(transcription_buffer) > SAMPLE_RATE * BYTES_PER_SAMPLE * 0.5:
+                            chunk_text = self.transcribe_audio(bytes(transcription_buffer))
+                            if chunk_text:
+                                _, cleaned_text = self.check_stop_phrase(chunk_text)
+                                if cleaned_text:
+                                    full_transcription.append(cleaned_text)
+                        
+                        final_text = " ".join(full_transcription)
+                        await websocket.send(f"TRANSCRIPTION:{final_text}")
+                        await websocket.send("MODE:command")
+                        
+                        full_transcription = []
+                        transcription_buffer.clear()
+                        self.wake_model.reset()
+                        mode = Mode.LISTENING
                         await websocket.send("STATUS:Listening...")
                         
         except websockets.exceptions.ConnectionClosed:
@@ -235,9 +361,9 @@ class JeevesServer:
     async def run(self):
         log(f"Jeeves server starting on ws://{self.host}:{self.port}")
         log(f"Wake words: {', '.join(self.wake_word_names)}")
-        log(f"Threshold: {WAKE_THRESHOLD}")
-        log(f"Post-wake discard: {POST_WAKE_DELAY}s")
-        log(f"Silence detection: {INITIAL_SILENCE_DURATION}s initial, {SHORT_SILENCE_DURATION}s after speech")
+        log(f"Modes: Command (Whisper), Transcription (chunked)")
+        log(f"Transcription triggers: {TRANSCRIPTION_TRIGGERS}")
+        log(f"Stop phrases: {STOP_PHRASES}")
         
         async with websockets.serve(
             self.handle_client,

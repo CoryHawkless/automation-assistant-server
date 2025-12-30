@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+FROM nvcr.io/nvidia/pytorch:25.02-py3
 
 WORKDIR /app
 
@@ -8,8 +8,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-dev \
     ffmpeg \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+    git
+
+
 
 # Python deps
 RUN pip3 install --no-cache-dir \
@@ -19,11 +20,11 @@ RUN pip3 install --no-cache-dir \
     openwakeword \
     onnxruntime
 
+RUN apt-get update
+RUN apt-get install -y portaudio19-dev python3-pyaudio
+RUN pip3 install pyaudio
+
 # Download wake word models
-RUN python3 -c "from openwakeword import utils; utils.download_models()"
+RUN python3 -c "import openwakeword; openwakeword.Model()"
 
-COPY jeeves_server.py .
-
-EXPOSE 8765
-
-CMD ["python3", "jeeves_server.py"]
+WORKDIR /code

@@ -11,12 +11,14 @@ services:
     volumes:
       - whisper-cache:/root/.cache/huggingface
       - openwakeword-cache:/root/.cache/openwakeword
+      - .:/code/
+    command: python3 /code/jeeves_server.py
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
 
 volumes:
