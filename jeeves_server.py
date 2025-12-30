@@ -24,6 +24,7 @@ BYTES_PER_SAMPLE = 2
 # Wake word settings
 WAKE_THRESHOLD = 0.5
 POST_WAKE_DELAY = 0.3
+POST_COMMAND_COOLDOWN = 0.5  # Ignore wake words for 0.5s after command completes
 
 # Command mode settings
 SILENCE_THRESHOLD = 0.01
@@ -54,7 +55,7 @@ TRANSCRIPTION_TRIGGERS = [
     "dictation mode",
 ]
 
-DEBUG = False
+DEBUG = True
 
 
 def log(msg: str, level: str = "INFO"):
@@ -112,7 +113,8 @@ class JeevesServer:
     def is_silence(self, audio_bytes: bytes) -> bool:
         return self.get_audio_level(audio_bytes) < SILENCE_THRESHOLD
 
-    def detect_wake_word(self, audio_bytes: bytes) -> tuple[bool, float, str]:
+    def detect_wake_word(self, audio_bytes: bytes) -> tuple[bool, float, str, dict]:
+        """Detect wake word and return prediction scores for all models"""
         audio = np.frombuffer(audio_bytes, dtype=np.int16)
         prediction = self.wake_model.predict(audio)
         
@@ -126,7 +128,7 @@ class JeevesServer:
                 if score > WAKE_THRESHOLD:
                     detected_word = name
         
-        return detected_word is not None, max_score, detected_word
+        return detected_word is not None, max_score, detected_word, prediction
 
     def transcribe_audio(self, audio_data: bytes) -> str:
         """Transcribe audio using Whisper"""
@@ -164,6 +166,13 @@ class JeevesServer:
         
         self.wake_model.reset()
         
+        # Session diagnostics for bug isolation
+        session_wake_count = 0
+        session_transcription_count = 0
+        consecutive_empty_transcriptions = 0
+        last_transcription_text = ""
+        consecutive_silence_chunks = 0  # Track consecutive silent chunks
+        
         mode = Mode.LISTENING
         audio_buffer = bytearray()
         transcription_buffer = bytearray()
@@ -174,6 +183,7 @@ class JeevesServer:
         last_chunk_time: Optional[float] = None
         speech_detected = False
         post_wake_discard_until: Optional[float] = None
+        post_command_cooldown_until: Optional[float] = None
         
         try:
             async for message in websocket:
@@ -193,15 +203,49 @@ class JeevesServer:
                         mode = Mode.COMMAND
                         continue
                 
-                audio_chunk = message
+                # Make a copy of audio chunk to avoid BufferError from numpy views
+                audio_chunk = bytes(message)
                 now = time.time()
+                
+                # === DIAGNOSTIC: Audio level logging ===
+                chunk_level = self.get_audio_level(audio_chunk)
+                chunk_is_silence = self.is_silence(audio_chunk)
+                chunk_duration = len(audio_chunk) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                chunk_db = 20 * np.log10(chunk_level + 1e-10)  # Convert to dB
+                
+                if chunk_is_silence:
+                    consecutive_silence_chunks += 1
+                else:
+                    consecutive_silence_chunks = 0
+                
+                debug(f"AUDIO_LEVEL: {chunk_db:.1f}dB chunk={len(audio_chunk)} bytes "
+                      f"{'SILENCE' if chunk_is_silence else 'SPEECH'} "
+                      f"(consecutive={consecutive_silence_chunks})")
                 
                 # === LISTENING MODE ===
                 if mode == Mode.LISTENING:
-                    detected, score, wake_word = self.detect_wake_word(audio_chunk)
+                    # Check if we're in post-command cooldown period
+                    if post_command_cooldown_until and now < post_command_cooldown_until:
+                        debug(f"POST_COMMAND_COOLDOWN: ignoring wake detection for {post_command_cooldown_until - now:.2f}s")
+                        # Still feed audio to wake model to keep it updated, but ignore detections
+                        audio_for_wake = np.frombuffer(audio_chunk, dtype=np.int16)
+                        self.wake_model.predict(audio_for_wake)
+                        continue
+                    
+                    post_command_cooldown_until = None
+                    
+                    # Only scan for wake words in LISTENING mode (call predict() only once)
+                    detected, score, wake_word, wake_prediction = self.detect_wake_word(audio_chunk)
+                    
+                    # DIAGNOSTIC: Log all wake word scores (only in LISTENING mode)
+                    for wname in self.wake_word_names:
+                        wscore = float(wake_prediction.get(wname, 0))
+                        debug(f"WAKE_SCAN: {wname}={wscore:.2f}, threshold={WAKE_THRESHOLD} "
+                              f"{'→ DETECTED' if wscore > WAKE_THRESHOLD else ''}")
                     
                     if detected:
-                        log(f"Wake word '{wake_word}' detected (score: {score:.2f})")
+                        session_wake_count += 1
+                        log(f"Wake word '{wake_word}' detected (score: {score:.2f}) [wake #{session_wake_count}]")
                         await websocket.send(f"WAKE:{wake_word}")
                         
                         audio_buffer = bytearray()
@@ -210,6 +254,7 @@ class JeevesServer:
                         silence_start = None
                         speech_detected = False
                         mode = Mode.COMMAND
+                        continue
                 
                 # === COMMAND MODE ===
                 elif mode == Mode.COMMAND:
@@ -221,33 +266,61 @@ class JeevesServer:
                     
                     audio_buffer.extend(audio_chunk)
                     
-                    if not self.is_silence(audio_chunk):
+                    if not chunk_is_silence:
                         if not speech_detected:
-                            debug("Speech detected")
+                            debug("Speech detected - first non-silence chunk")
                         speech_detected = True
                         silence_start = None
                     else:
                         if silence_start is None:
                             silence_start = now
+                            debug(f"Silence started at {now:.3f}")
                         
                         silence_duration = INITIAL_SILENCE_DURATION if not speech_detected else SHORT_SILENCE_DURATION
+                        current_silence_duration = now - silence_start
+                        
+                        # DIAGNOSTIC: Log silence state
+                        debug(f"SILENCE_WAIT: duration={current_silence_duration:.2f}s, "
+                              f"threshold={silence_duration:.2f}s, speech_detected={speech_detected}")
                         
                         if now - silence_start >= silence_duration:
                             await websocket.send("STATUS:Processing command...")
                             
                             buffer_duration = len(audio_buffer) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
                             
+                            # DIAGNOSTIC: Detailed buffer state before transcription
+                            debug(f"BUFFER_STATE: duration={buffer_duration:.2f}s, "
+                                  f"speech_detected={speech_detected}, "
+                                  f"silence_duration={current_silence_duration:.2f}s, "
+                                  f"consecutive_empty={consecutive_empty_transcriptions}")
+                            
                             if buffer_duration < MIN_SPEECH_DURATION:
+                                debug(f"BUFFER_TOO_SHORT: {buffer_duration:.2f}s < {MIN_SPEECH_DURATION}s minimum")
                                 await websocket.send("STATUS:No command detected")
                             else:
-                                log(f"Transcribing command ({buffer_duration:.1f}s)...")
+                                log(f"Transcribing command ({buffer_duration:.1f}s, speech={speech_detected})...")
                                 start = time.time()
                                 text = self.transcribe_audio(bytes(audio_buffer))
-                                log(f"Command transcribed in {time.time() - start:.2f}s: '{text}'")
+                                transcribe_time = time.time() - start
+                                log(f"Command transcribed in {transcribe_time:.2f}s: '{text}'")
+                                
+                                # DIAGNOSTIC: Track consecutive empty transcriptions
+                                if not text or text.strip() == "":
+                                    consecutive_empty_transcriptions += 1
+                                    debug(f"EMPTY_TRANSCRIPTION: #{consecutive_empty_transcriptions} in this session")
+                                    if consecutive_empty_transcriptions > 3:
+                                        log(f"WARN: {consecutive_empty_transcriptions} consecutive empty transcriptions - possible loop", "WARN")
+                                else:
+                                    consecutive_empty_transcriptions = 0
                                 
                                 if text:
+                                    # Check for suspicious silence-only transcription
+                                    if not speech_detected and consecutive_empty_transcriptions > 1:
+                                        log("WARN: Empty transcription with no speech detected - check audio source", "WARN")
+                                    
                                     if self.check_transcription_trigger(text):
-                                        log("Entering transcription mode")
+                                        session_transcription_count += 1
+                                        log(f"Entering transcription mode [session trans #{session_transcription_count}]")
                                         await websocket.send("MODE:transcription")
                                         await websocket.send("STATUS:Transcription mode - say 'stop transcription' when done")
                                         
@@ -266,18 +339,25 @@ class JeevesServer:
                             
                             audio_buffer.clear()
                             self.wake_model.reset()
+                            post_command_cooldown_until = now + POST_COMMAND_COOLDOWN
                             mode = Mode.LISTENING
                             await websocket.send("STATUS:Listening...")
                             continue
                     
                     if elapsed >= MAX_COMMAND_DURATION:
-                        log("Max command duration reached")
+                        log(f"Max command duration reached ({elapsed:.1f}s)")
                         await websocket.send("STATUS:Processing command...")
+                        
+                        # DIAGNOSTIC: Log final buffer state
+                        final_buffer_duration = len(audio_buffer) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+                        debug(f"MAX_DURATION_BUFFER: {final_buffer_duration:.2f}s, speech_detected={speech_detected}")
+                        
                         text = self.transcribe_audio(bytes(audio_buffer))
                         
                         if text:
                             if self.check_transcription_trigger(text):
-                                log("Entering transcription mode")
+                                session_transcription_count += 1
+                                log(f"Entering transcription mode [session trans #{session_transcription_count}]")
                                 await websocket.send("MODE:transcription")
                                 await websocket.send("STATUS:Transcription mode - say 'stop transcription' when done")
                                 
@@ -292,6 +372,7 @@ class JeevesServer:
                         
                         audio_buffer.clear()
                         self.wake_model.reset()
+                        post_command_cooldown_until = now + POST_COMMAND_COOLDOWN
                         mode = Mode.LISTENING
                         await websocket.send("STATUS:Listening...")
                 
@@ -327,6 +408,7 @@ class JeevesServer:
                                 
                                 full_transcription = []
                                 self.wake_model.reset()
+                                post_command_cooldown_until = now + POST_COMMAND_COOLDOWN
                                 mode = Mode.LISTENING
                                 await websocket.send("STATUS:Listening...")
                                 continue
@@ -348,6 +430,7 @@ class JeevesServer:
                         full_transcription = []
                         transcription_buffer.clear()
                         self.wake_model.reset()
+                        post_command_cooldown_until = now + POST_COMMAND_COOLDOWN
                         mode = Mode.LISTENING
                         await websocket.send("STATUS:Listening...")
                         
