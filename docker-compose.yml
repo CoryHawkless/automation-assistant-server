@@ -13,6 +13,10 @@ services:
       - openwakeword-cache:/root/.cache/openwakeword
       - .:/code/
     command: python3 /code/jeeves_server.py
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
     deploy:
       resources:
         reservations:
