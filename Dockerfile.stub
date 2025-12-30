@@ -1,0 +1,11 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir websockets
+
+COPY jeeves_server_stub.py .
+
+EXPOSE 8765
+
+CMD ["python", "jeeves_server_stub.py"]

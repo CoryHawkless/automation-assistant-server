@@ -1,0 +1,24 @@
+services:
+  jeeves:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - whisper-cache:/root/.cache/huggingface
+      - openwakeword-cache:/root/.cache/openwakeword
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  whisper-cache:
+  openwakeword-cache:

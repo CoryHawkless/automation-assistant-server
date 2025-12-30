@@ -1,0 +1,10 @@
+services:
+  jeeves-stub:
+    build:
+      context: .
+      dockerfile: Dockerfile.stub
+    ports:
+      - "8765:8765"
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
